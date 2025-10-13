@@ -1,0 +1,105 @@
+#include <Wire.h>
+#include <Servo.h>
+#include <math.h>
+
+// ---- PID GAINS ----
+float Kp = 3.0;
+float Ki = 0.3;
+float Kd = 0.05;
+
+// ---- PID VARIABLES ----
+float error = 0, prevError = 0, integral = 0;
+float dt = 0.01; // seconds (100 Hz loop)
+
+// ---- IMU VARIABLES ----
+float accelX, accelY, accelZ;
+float gyroX, gyroY, gyroZ;
+float theta_est;  // estimated tilt (degrees)
+
+// ---- FIN CONTROL ----
+Servo finFL; // front-left
+Servo finFR; // front-right
+Servo finBL; // back-left
+Servo finBR; // back-right
+float finDefl;
+
+// ---- LOOP TIMING ----
+unsigned long lastTime = 0;
+
+// ---- TARGET ----
+float targetAngle = 0.0; // want to be upright (0°)
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  // Attach fins (adjust pins as needed)
+  finFL.attach(3);
+  finFR.attach(5);
+  finBL.attach(6);
+  finBR.attach(9);
+
+  // Center fins
+  finFL.write(90);
+  finFR.write(90);
+  finBL.write(90);
+  finBR.write(90);
+
+  lastTime = millis();
+}
+
+// ---- READ IMU (stub; replace with your actual IMU library) ----
+void readIMU() {
+  // Example: replace with MPU6050, BNO055, etc.
+  // Here we simulate IMU readings for structure only.
+  accelX = 0.0;
+  accelY = -sin(radians(theta_est)); // simulated gravity projection
+  accelZ = cos(radians(theta_est));
+
+  gyroX = 0.0; // deg/s
+  gyroY = 0.0;
+  gyroZ = 0.0;
+}
+
+// ---- COMPUTE TILT ANGLE FROM ACCEL ----
+float getTiltAngle() {
+  // Calculate pitch from accel (simplified)
+  float pitch = atan2(-accelY, accelZ) * 180.0 / PI; // in degrees
+  return pitch;
+}
+
+// ---- MAIN LOOP ----
+void loop() {
+  unsigned long now = millis();
+  if (now - lastTime >= 10) { // 100 Hz update
+    lastTime = now;
+
+    // --- Read IMU data ---
+    readIMU();
+    theta_est = getTiltAngle();
+
+    // --- PID control ---
+    error = targetAngle - theta_est;
+    integral += error * dt;
+    float derivative = (error - prevError) / dt;
+    finDefl = Kp * error + Ki * integral + Kd * derivative;
+    prevError = error;
+
+    // --- Limit fin deflection ---
+    if (finDefl > 20) finDefl = 20;
+    if (finDefl < -20) finDefl = -20;
+
+    // --- Convert to servo angles (centered at 90°) ---
+    int servoAngle = 90 + finDefl;  // simple mapping
+
+    // --- Apply to fins (same deflection for simplicity) ---
+    finFL.write(servoAngle);
+    finFR.write(servoAngle);
+    finBL.write(servoAngle);
+    finBR.write(servoAngle);
+
+    // --- Print debug info ---
+    Serial.print("Tilt: "); Serial.print(theta_est);
+    Serial.print("  Fin: "); Serial.println(finDefl);
+  }
+}
