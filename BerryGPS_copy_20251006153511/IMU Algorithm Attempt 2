@@ -1,71 +1,105 @@
-import numpy as np
-import matplotlib.pyplot as plt
+#include <Wire.h>
+#include <Servo.h>
+#include <math.h>
 
-# --- Simulation parameters ---
-dt = 0.01         # time step (s)
-T = 10.0          # total time (s)
-steps = int(T / dt)
+// ---- PID GAINS ----
+float Kp = 3.0;
+float Ki = 0.3;
+float Kd = 0.05;
 
-# --- Physical parameters ---
-I = 0.02          # moment of inertia (kg·m²)
-K_aero = 0.1      # aerodynamic damping
-K_fin = 0.05      # torque per deg of fin deflection
-g = 9.81          # gravity (m/s²)
+// ---- PID VARIABLES ----
+float error = 0, prevError = 0, integral = 0;
+float dt = 0.01; // seconds (100 Hz loop)
 
-# --- PID gains ---
-Kp, Ki, Kd = 3.0, 0.3, 0.05
+// ---- IMU VARIABLES ----
+float accelX, accelY, accelZ;
+float gyroX, gyroY, gyroZ;
+float theta_est;  // estimated tilt (degrees)
 
-# --- Initialize state ---
-theta = 20.0      # tilt angle (degrees)
-omega = 0.0       # angular velocity (deg/s)
-int_err = 0.0
-prev_err = 0.0
+// ---- FIN CONTROL ----
+Servo finFL; // front-left
+Servo finFR; // front-right
+Servo finBL; // back-left
+Servo finBR; // back-right
+float finDefl;
 
-# --- Logging ---
-theta_log, fin_log = [], []
+// ---- LOOP TIMING ----
+unsigned long lastTime = 0;
 
-for i in range(steps):
-    # --- IMU-like measurements ---
-    # Gyroscope measures angular rate (deg/s)
-    gyro_meas = omega + np.random.normal(0, 0.1)
+// ---- TARGET ----
+float targetAngle = 0.0; // want to be upright (0°)
 
-    # Accelerometer measures gravity projection in g units
-    # tilt of θ => measured acceleration = -sin(θ)
-    accel_meas = -np.sin(np.radians(theta))  # in g
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
 
-    # Estimate tilt angle (from accel only)
-    theta_est = np.degrees(np.arcsin(-accel_meas))  # convert to deg
+  // Attach fins (adjust pins as needed)
+  finFL.attach(3);
+  finFR.attach(5);
+  finBL.attach(6);
+  finBR.attach(9);
 
-    # --- PID controller ---
-    err = 0.0 - theta_est  # target = 0° (upright)
-    int_err += err * dt
-    deriv = (err - prev_err) / dt
-    fin_defl = Kp * err + Ki * int_err + Kd * deriv
-    prev_err = err
+  // Center fins
+  finFL.write(90);
+  finFR.write(90);
+  finBL.write(90);
+  finBR.write(90);
 
-    # Limit fin movement
-    fin_defl = np.clip(fin_defl, -20, 20)
+  lastTime = millis();
+}
 
-    # --- Physics update ---
-    # Fin creates torque; damping resists motion
-    torque = -K_fin * fin_defl - K_aero * omega
-    alpha = torque / I                  # angular acceleration (deg/s²)
-    omega += alpha * dt                 # update angular velocity (deg/s)
-    theta += omega * dt                 # update angle (deg)
+// ---- READ IMU (stub; replace with your actual IMU library) ----
+void readIMU() {
+  // Example: replace with MPU6050, BNO055, etc.
+  // Here we simulate IMU readings for structure only.
+  accelX = 0.0;
+  accelY = -sin(radians(theta_est)); // simulated gravity projection
+  accelZ = cos(radians(theta_est));
 
-    theta_log.append(theta)
-    fin_log.append(fin_defl)
+  gyroX = 0.0; // deg/s
+  gyroY = 0.0;
+  gyroZ = 0.0;
+}
 
-# --- Plot results ---
-time = np.arange(steps) * dt
-plt.figure(figsize=(10,5))
-plt.subplot(2,1,1)
-plt.plot(time, theta_log)
-plt.ylabel("Tilt angle (°)")
-plt.grid(True)
-plt.subplot(2,1,2)
-plt.plot(time, fin_log)
-plt.ylabel("Fin deflection (°)")
-plt.xlabel("Time (s)")
-plt.grid(True)
-plt.show()
+// ---- COMPUTE TILT ANGLE FROM ACCEL ----
+float getTiltAngle() {
+  // Calculate pitch from accel (simplified)
+  float pitch = atan2(-accelY, accelZ) * 180.0 / PI; // in degrees
+  return pitch;
+}
+
+// ---- MAIN LOOP ----
+void loop() {
+  unsigned long now = millis();
+  if (now - lastTime >= 10) { // 100 Hz update
+    lastTime = now;
+
+    // --- Read IMU data ---
+    readIMU();
+    theta_est = getTiltAngle();
+
+    // --- PID control ---
+    error = targetAngle - theta_est;
+    integral += error * dt;
+    float derivative = (error - prevError) / dt;
+    finDefl = Kp * error + Ki * integral + Kd * derivative;
+    prevError = error;
+
+    // --- Limit fin deflection ---
+    if (finDefl > 20) finDefl = 20;
+    if (finDefl < -20) finDefl = -20;
+
+    // --- Convert to servo angles (centered at 90°) ---
+    int servoAngle = 90 + finDefl;  // simple mapping
+
+    // --- Apply to fins (same deflection for simplicity) ---
+    finFL.write(servoAngle);
+    finFR.write(servoAngle);
+    finBL.write(servoAngle);
+    finBR.write(servoAngle);
+
+    // --- Print debug info ---
+    Serial.print("Tilt: "); Serial.print(theta_est);
+    Serial.print("  Fin: "); Serial.println(finDefl);
+  }
+}
