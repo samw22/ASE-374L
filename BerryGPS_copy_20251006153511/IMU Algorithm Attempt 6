@@ -122,13 +122,14 @@ void loop() {
   Serial.print(pitch, 1);
   Serial.print(" Y:");
   Serial.print(yaw, 1);
+/*
   Serial.print("  MX:");
   Serial.print(mx_raw);
   Serial.print(" MY:");
   Serial.print(my_raw);
   Serial.print(" MZ:");
   Serial.println(mz_raw);
-
+*/
 
 // --- Fin Control Section ---  // Modded to include yaw
 int base = 90;
