@@ -1,0 +1,173 @@
+#include <Wire.h>
+#include <Servo.h>
+#include <math.h>
+
+// ---- I2C Addresses ----
+#define LSM6DSL_ADDR 0x6A
+#define LIS3MDL_ADDR 0x1C
+
+// ---- LSM6DSL Registers ----
+#define CTRL1_XL 0x10
+#define CTRL2_G  0x11
+#define OUTX_L_G 0x22
+#define OUTX_L_XL 0x28
+
+// ---- LIS3MDL Registers ----
+#define CTRL_REG1_M 0x20
+#define CTRL_REG2_M 0x21
+#define CTRL_REG3_M 0x22
+#define OUTX_L_REG_M 0x28
+
+// ---- Servos ----
+Servo servoBR;
+Servo servoTR;
+Servo servoBL;
+Servo servoTL;
+
+// ---- Helper functions ----
+void writeRegister(byte addr, byte reg, byte value) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+int16_t read16(byte addr, byte reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(addr, 2);
+  int16_t value = Wire.read() | (Wire.read() << 8);
+  return value;
+}
+
+void readMagRaw(int16_t &mx, int16_t &my, int16_t &mz) {
+  Wire.beginTransmission(LIS3MDL_ADDR);
+  Wire.write(OUTX_L_REG_M);
+  Wire.endTransmission(false);
+  Wire.requestFrom(LIS3MDL_ADDR, 6);
+
+  mx = Wire.read() | (Wire.read() << 8);
+  my = Wire.read() | (Wire.read() << 8);
+  mz = Wire.read() | (Wire.read() << 8);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  // ---- Initialize Servos ----
+  servoTR.attach(12);
+  servoBR.attach(13);
+  servoTL.attach(9);
+  servoBL.attach(3);
+
+  servoTR.write(90);
+  servoBR.write(90);
+  servoTL.write(90);
+  servoBL.write(90);
+
+  // ---- Initialize IMU ----
+  writeRegister(LSM6DSL_ADDR, CTRL1_XL, 0x40); // Accel 104Hz ±2g
+  writeRegister(LSM6DSL_ADDR, CTRL2_G,  0x40); // Gyro 104Hz 245 dps
+
+  // ---- Initialize Magnetometer ----
+  writeRegister(LIS3MDL_ADDR, CTRL_REG1_M, 0x70); // Ultra-high perf X/Y, 10Hz
+  writeRegister(LIS3MDL_ADDR, CTRL_REG2_M, 0x00); // ±4 gauss
+  writeRegister(LIS3MDL_ADDR, CTRL_REG3_M, 0x00); // Continuous conversion
+
+  Serial.println("BerryGPS IMU Initialized!");
+}
+
+void loop() {
+  // ---- Read Accelerometer ----
+  int16_t ax = read16(LSM6DSL_ADDR, OUTX_L_XL);
+  int16_t ay = read16(LSM6DSL_ADDR, OUTX_L_XL + 2);
+  int16_t az = read16(LSM6DSL_ADDR, OUTX_L_XL + 4);
+
+  // Convert to g
+  float ax_g = ax * 0.000061;
+  float ay_g = ay * 0.000061;
+  float az_g = az * 0.000061;
+
+  // ---- Calculate Roll and Pitch ----
+  float roll = atan2(ay_g, az_g);
+  float pitch = atan2(-ax_g, sqrt(ay_g * ay_g + az_g * az_g));
+
+  // ---- Read Magnetometer ----
+  int16_t mx_raw, my_raw, mz_raw;
+  readMagRaw(mx_raw, my_raw, mz_raw);
+
+  // ---- Optional: Apply rough offsets (change if needed) ----
+  float mx = mx_raw - 0;
+  float my = my_raw - 0;
+  float mz = mz_raw - 0;
+
+  // ---- Tilt Compensation for Magnetometer ----
+  float mx_comp = mx * cos(pitch) + mz * sin(pitch);
+  float my_comp = mx * sin(roll) * sin(pitch) + my * cos(roll) - mz * sin(roll) * cos(pitch);
+
+  // ---- Calculate Yaw (in degrees 0–360) ----
+  float yaw = atan2(-my_comp, mx_comp) * 180.0 / PI;
+  if (yaw < 0) yaw += 360.0;
+
+  // ---- Convert roll/pitch to degrees ----
+  roll *= 180.0 / PI;
+  pitch *= 180.0 / PI;
+
+  // ---- Print results ----
+  Serial.print("R:");
+  Serial.print(roll, 1);
+  Serial.print(" P:");
+  Serial.print(pitch, 1);
+  Serial.print(" Y:");
+  Serial.print(yaw, 1);
+/*
+  Serial.print("  MX:");
+  Serial.print(mx_raw);
+  Serial.print(" MY:");
+  Serial.print(my_raw);
+  Serial.print(" MZ:");
+  Serial.println(mz_raw);
+*/
+
+
+// --- Fin Control Section ---
+int base = 90;
+
+// Gain factors (tune as needed)
+float kPitch = 2.0;
+float kRoll  = 2.0;
+float kYaw   = 1.0;
+
+// --- Threshold in degrees ---
+float angleThreshold = 10.0;
+
+// Compute errors
+int pitchCorr = constrain(pitch * kPitch, -45, 45);
+int rollCorr  = constrain(roll  * kRoll,  -45, 45);
+
+// Compute yaw drift relative to initial heading
+static float yawRef = yaw;
+float yawError = yaw - yawRef;
+if (yawError > 180) yawError -= 360;
+if (yawError < -180) yawError += 360;
+int yawCorr = constrain(yawError * kYaw, -30, 30);
+
+// --- Apply only if above threshold ---
+if (abs(pitch) > angleThreshold || abs(roll) > angleThreshold || abs(yawError) > angleThreshold) {
+  // Apply corrections
+  servoTR.write(base + pitchCorr - rollCorr + yawCorr);
+  servoBR.write(base - pitchCorr - rollCorr - yawCorr);
+  servoTL.write(base + pitchCorr + rollCorr - yawCorr);
+  servoBL.write(base - pitchCorr + rollCorr + yawCorr);
+} else {
+  // Keep fins neutral
+  servoTR.write(base);
+  servoBR.write(base);
+  servoTL.write(base);
+  servoBL.write(base);
+}
+
+  delay(200);
+}
