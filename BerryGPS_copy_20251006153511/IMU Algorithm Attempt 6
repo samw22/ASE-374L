@@ -130,7 +130,7 @@ void loop() {
   Serial.println(mz_raw);
 
 
-// --- Fin Control Section ---
+// --- Fin Control Section ---  // Modded to include yaw
 int base = 90;
 
 // Gain factors (tune these experimentally)
