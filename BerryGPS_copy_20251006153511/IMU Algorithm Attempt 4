@@ -1,0 +1,115 @@
+#include <Wire.h>
+#include <MadgwickAHRS.h>
+#include <math.h>
+
+// Addresses
+#define LSM6DSL_ADDR 0x6A
+#define LIS3MDL_ADDR 0x1C  // use 0x1E if 0x1C doesn't work
+
+// LSM6DSL registers
+#define CTRL1_XL 0x10
+#define CTRL2_G  0x11
+#define OUTX_L_G 0x22
+#define OUTX_L_XL 0x28
+
+// LIS3MDL registers
+#define CTRL_REG1_M 0x20
+#define CTRL_REG2_M 0x21
+#define CTRL_REG3_M 0x22
+#define OUTX_L_M 0x28
+
+Madgwick filter;
+
+unsigned long lastUpdate = 0;
+
+// Helper functions
+void writeReg(byte addr, byte reg, byte val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+int16_t read16(byte addr, byte reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(addr, 2);
+  int16_t val = Wire.read() | (Wire.read() << 8);
+  return val;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  // --- Init accelerometer + gyro ---
+  writeReg(LSM6DSL_ADDR, CTRL1_XL, 0x40); // 104 Hz, ±2g
+  writeReg(LSM6DSL_ADDR, CTRL2_G, 0x40);  // 104 Hz, 245 dps
+
+  // --- Init magnetometer ---
+  writeReg(LIS3MDL_ADDR, CTRL_REG1_M, 0x70); // Ultra-high perf X/Y, 80Hz
+  writeReg(LIS3MDL_ADDR, CTRL_REG2_M, 0x00); // ±4 gauss
+  writeReg(LIS3MDL_ADDR, CTRL_REG3_M, 0x00); // Continuous mode
+
+  filter.begin(104); // roughly 104 Hz
+
+  lastUpdate = micros();
+  Serial.println("IMU + Magnetometer initialized!");
+}
+
+void loop() {
+  // --- Timing ---
+  unsigned long now = micros();
+  float dt = (now - lastUpdate) / 1000000.0;
+  lastUpdate = now;
+
+  // --- Read accel ---
+  int16_t ax = read16(LSM6DSL_ADDR, OUTX_L_XL);
+  int16_t ay = read16(LSM6DSL_ADDR, OUTX_L_XL + 2);
+  int16_t az = read16(LSM6DSL_ADDR, OUTX_L_XL + 4);
+
+  // --- Read gyro ---
+  int16_t gx = read16(LSM6DSL_ADDR, OUTX_L_G);
+  int16_t gy = read16(LSM6DSL_ADDR, OUTX_L_G + 2);
+  int16_t gz = read16(LSM6DSL_ADDR, OUTX_L_G + 4);
+
+  // --- Read magnetometer ---
+  int16_t mx = read16(LIS3MDL_ADDR, OUTX_L_M);
+  int16_t my = read16(LIS3MDL_ADDR, OUTX_L_M + 2);
+  int16_t mz = read16(LIS3MDL_ADDR, OUTX_L_M + 4);
+
+  // --- Convert to physical units ---
+  float ax_g = ax * 0.000061; // g
+  float ay_g = ay * 0.000061;
+  float az_g = az * 0.000061;
+
+  float gx_dps = gx * 0.00875; // deg/s
+  float gy_dps = gy * 0.00875;
+  float gz_dps = gz * 0.00875;
+
+  float mx_uT = mx * 0.14; // microtesla
+  float my_uT = my * 0.14;
+  float mz_uT = mz * 0.14;
+
+  // --- Update Madgwick filter ---
+  filter.update(gx_dps * DEG_TO_RAD,
+                gy_dps * DEG_TO_RAD,
+                gz_dps * DEG_TO_RAD,
+                ax_g, ay_g, az_g,
+                mx_uT, my_uT, mz_uT);
+
+  // --- Extract Euler angles ---
+  float roll  = filter.getRoll();
+  float pitch = filter.getPitch();
+  float yaw   = filter.getYaw();
+
+  Serial.print("Roll: ");
+  Serial.print(roll, 1);
+  Serial.print("  Pitch: ");
+  Serial.print(pitch, 1);
+  Serial.print("  Yaw: ");
+  Serial.println(yaw, 1);
+
+  delay(50);
+}
