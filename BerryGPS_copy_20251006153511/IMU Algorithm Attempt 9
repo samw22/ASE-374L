@@ -1,0 +1,152 @@
+#include <Wire.h>
+#include <Servo.h>
+#include <TinyGPSPlus.h>
+#include <Adafruit_BNO055.h>
+#include <Adafruit_Sensor.h>
+
+// ======= GPS (hardware serial pins 0 & 1) =======
+TinyGPSPlus gps;
+
+// ======= GPS and IMU setup =======
+Adafruit_BNO055 bno = Adafruit_BNO055(55);
+
+// ======= Servo pins =======
+Servo rollServo;
+Servo pitchServo;
+Servo yawServo;
+
+// ======= Control gains =======
+float kRoll = 2.0;
+float kPitch = 2.0;
+float kYaw = 1.0;
+
+// ======= Adaptive tuning =======
+float prevDistance = 0;
+float improvementTol = 2.0;
+unsigned long lastAdaptTime = 0;
+unsigned long adaptInterval = 3000;
+
+// ======= Target =======
+float targetLat = 37.7749;
+float targetLon = -122.4194;
+
+// ======= State =======
+bool haveFix = false;
+bool descentMode = false;
+
+
+// ======= Utility functions =======
+float getDistance(float lat1, float lon1, float lat2, float lon2) {
+  float R = 6371000.0;
+  float dLat = radians(lat2 - lat1);
+  float dLon = radians(lat2 - lon1);
+  float a = sin(dLat / 2) * sin(dLat / 2) +
+            cos(radians(lat1)) * cos(radians(lat2)) *
+            sin(dLon / 2) * sin(dLon / 2);
+  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+float getBearing(float lat1, float lon1, float lat2, float lon2) {
+  float dLon = radians(lon2 - lon1);
+  float y = sin(dLon) * cos(radians(lat2));
+  float x = cos(radians(lat1)) * sin(radians(lat2)) -
+            sin(radians(lat1)) * cos(radians(lat2)) * cos(dLon);
+  float brng = degrees(atan2(y, x));
+  return fmod((brng + 360.0), 360.0);
+}
+
+
+// ======= Setup =======
+void setup() {
+  Serial.begin(9600);   // GPS uses this port now!
+  Wire.begin();
+
+  rollServo.attach(3);
+  pitchServo.attach(5);
+  yawServo.attach(6);
+
+  if (!bno.begin()) {
+    while (1);  // Cannot print error — serial is used by GPS
+  }
+}
+
+
+// ======= Loop =======
+void loop() {
+
+  // ---- Read GPS from Serial (pins 0 & 1) ----
+  while (Serial.available()) {
+    gps.encode(Serial.read());
+  }
+
+  if (gps.location.isValid()) haveFix = true;
+  if (!haveFix) return;
+
+
+  // ---- IMU readings ----
+  sensors_event_t orientationData;
+  bno.getEvent(&orientationData);
+
+  float yaw = orientationData.orientation.x;
+  float pitch = orientationData.orientation.y;
+  float roll = orientationData.orientation.z;
+
+
+  // ---- GPS values ----
+  float currentLat = gps.location.lat();
+  float currentLon = gps.location.lng();
+
+  float distanceToTarget = getDistance(currentLat, currentLon, targetLat, targetLon);
+  float targetBearing = getBearing(currentLat, currentLon, targetLat, targetLon);
+
+  float yawError = targetBearing - yaw;
+  if (yawError > 180) yawError -= 360;
+  if (yawError < -180) yawError += 360;
+
+
+  // ---- Enter descent mode ----
+  if (distanceToTarget < 15.0) descentMode = true;
+
+
+  // ---- Adaptive gains ----
+  unsigned long now = millis();
+  if (!descentMode && (now - lastAdaptTime > adaptInterval)) {
+
+    bool gettingCloser = (distanceToTarget < prevDistance - improvementTol);
+
+    if (!gettingCloser) {
+      kPitch += 0.2;
+      if (abs(yawError) > 15) kYaw += 0.1;
+    } else {
+      kPitch -= 0.05;
+      kYaw  -= 0.02;
+    }
+
+    kPitch = constrain(kPitch, 1.0, 6.0);
+    kYaw   = constrain(kYaw, 0.5, 3.0);
+
+    prevDistance = distanceToTarget;
+    lastAdaptTime = now;
+  }
+
+
+  // ---- Control law ----
+  float yawCmd   = constrain(kYaw   * (yawError / 90.0), -1, 1);
+  float pitchCmd = constrain(kPitch * (distanceToTarget / 100.0), -1, 1);
+
+
+  // ---- Descent mode ----
+  if (descentMode) {
+    pitchCmd = 0.6;
+    yawCmd *= 0.3;
+  }
+
+
+  // ---- Apply commands ----
+  rollServo.write(90);
+  pitchServo.write(90 + pitchCmd * 30);
+  yawServo.write(90 + yawCmd * 30);
+
+  delay(200);
+}

@@ -1,0 +1,42 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+// Pin definitions for Arduino Uno
+#define NSS   10
+#define RESET 9
+#define DIO0  2
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+
+  Serial.println("LoRa Receiver Starting...");
+
+  LoRa.setPins(NSS, RESET, DIO0);
+
+  // Use confirmed 433 MHz frequency
+  if (!LoRa.begin(433E6)) {
+    Serial.println("Starting LoRa failed!");
+    while (1);
+  }
+
+  Serial.println("LoRa Receiver Initialized!");
+  Serial.println("------------------------------");
+}
+
+void loop() {
+  // Try to parse an incoming packet
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    Serial.print("Received packet: ");
+
+    // Read each byte and print as characters
+    while (LoRa.available()) {
+      Serial.print((char)LoRa.read());
+    }
+
+    // Print RSSI (signal strength)
+    Serial.print(" | RSSI: ");
+    Serial.println(LoRa.packetRssi());
+  }
+}

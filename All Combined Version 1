@@ -1,0 +1,328 @@
+// Combined: GPS (SWSerial) + BerryIMU (LSM6DSL+LIS3MDL) + LoRa TX + 4 Servos (as actuators)
+// GPS: pins 4 (RX), 3 (TX)
+// Servos: BR=5, BL=6, TR=7, TL=8
+// LoRa: NSS=10, RESET=9, DIO0=2 (SPI on 11/12/13)
+
+#include <Wire.h>
+#include <math.h>
+#include <TinyGPSPlus.h>
+#include <SoftwareSerial.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <Servo.h>
+
+#define LSM6DSL_ADDR  0x6A   // Accelerometer + Gyro
+#define LIS3MDL_ADDR  0x1C   // Magnetometer
+#define PI 3.14159265358979323846
+
+// ===== GPS =====
+static const int GPS_RX = 4;   // GPS TX -> Arduino RX (SoftwareSerial)
+static const int GPS_TX = 3;   // GPS RX -> Arduino TX (optional)
+static const uint32_t GPSBaud = 9600;
+TinyGPSPlus gps;
+SoftwareSerial gpsSerial(GPS_RX, GPS_TX);
+
+// ===== LoRa pins =====
+#define LORA_NSS   10
+#define LORA_RESET 9
+#define LORA_DIO0  2
+#define LORA_FREQ  433E6
+
+// ===== Servos (actuators) =====
+// BR (Back Right)  -> pin 5
+// BL (Back Left)   -> pin 6
+// TR (Top Right)   -> pin 7
+// TL (Top Left)    -> pin 8
+Servo servoBR, servoBL, servoTR, servoTL;
+const int PIN_BR = 5;
+const int PIN_BL = 6;
+const int PIN_TR = 7;
+const int PIN_TL = 8;
+
+// ===== IMU / orientation =====
+float ax=0, ay=0, az=0;
+float mx=0, my=0, mz=0;
+
+// ===== Control gains & adaptive tuning =====
+float kPitch = 2.0;
+float kYaw   = 1.0;
+float prevDistance = 0;
+float improvementTol = 2.0;     // meters
+unsigned long lastAdaptTime = 0;
+unsigned long adaptInterval = 3000;  // ms
+
+// ===== Target (example) =====
+float targetLat = 37.7749;
+float targetLon = -122.4194;
+
+// ===== State =====
+bool haveFix = false;
+bool descentMode = false;
+
+// ================= Utility: Haversine + bearing =================
+float getDistance(float lat1, float lon1, float lat2, float lon2) {
+  float R = 6371000.0; // meters
+  float dLat = radians(lat2 - lat1);
+  float dLon = radians(lon2 - lon1);
+  float a = sin(dLat/2.0)*sin(dLat/2.0) +
+            cos(radians(lat1)) * cos(radians(lat2)) *
+            sin(dLon/2.0) * sin(dLon/2.0);
+  float c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+  return R * c;
+}
+
+float getBearing(float lat1, float lon1, float lat2, float lon2) {
+  float dLon = radians(lon2 - lon1);
+  float y = sin(dLon) * cos(radians(lat2));
+  float x = cos(radians(lat1)) * sin(radians(lat2)) -
+            sin(radians(lat1)) * cos(radians(lat2)) * cos(dLon);
+  float brng = degrees(atan2(y, x));
+  if (brng < 0) brng += 360.0;
+  return brng;
+}
+
+// ================= IMU read functions (from your snippet) =================
+void readAccel() {
+  Wire.beginTransmission(LSM6DSL_ADDR);
+  Wire.write(0x28);  // OUTX_L_XL
+  Wire.endTransmission(false);
+  Wire.requestFrom(LSM6DSL_ADDR, 6);
+
+  if (Wire.available() >= 6) {
+    int16_t rawX = Wire.read() | (Wire.read() << 8);
+    int16_t rawY = Wire.read() | (Wire.read() << 8);
+    int16_t rawZ = Wire.read() | (Wire.read() << 8);
+
+    ax = rawX * 0.000061;
+    ay = rawY * 0.000061;
+    az = rawZ * 0.000061;
+  }
+}
+
+void readMag() {
+  Wire.beginTransmission(LIS3MDL_ADDR);
+  Wire.write(0x28);  // OUT_X_L
+  Wire.endTransmission(false);
+  Wire.requestFrom(LIS3MDL_ADDR, 6);
+
+  if (Wire.available() >= 6) {
+    int16_t rawX = Wire.read() | (Wire.read() << 8);
+    int16_t rawY = Wire.read() | (Wire.read() << 8);
+    int16_t rawZ = Wire.read() | (Wire.read() << 8);
+
+    mx = rawX * 0.00014;
+    my = rawY * 0.00014;
+    mz = rawZ * 0.00014;
+  }
+}
+
+// ================= Setup =================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  gpsSerial.begin(GPSBaud);
+
+  // Servos
+  servoBR.attach(PIN_BR);
+  servoBL.attach(PIN_BL);
+  servoTR.attach(PIN_TR);
+  servoTL.attach(PIN_TL);
+
+  // Initialize IMU registers (your provided init)
+  Serial.println("Initializing IMU...");
+  // LSM6DSL accel init
+  Wire.beginTransmission(LSM6DSL_ADDR);
+  Wire.write(0x10);           // CTRL1_XL register
+  Wire.write(0b01100000);     // 104 Hz, 2g, 100 Hz BW
+  Wire.endTransmission();
+
+  // LIS3MDL magnetometer init
+  Wire.beginTransmission(LIS3MDL_ADDR);
+  Wire.write(0x20);           // CTRL_REG1
+  Wire.write(0b11111100);     // Ultra-high performance XY, 80 Hz
+  Wire.endTransmission();
+
+  Wire.beginTransmission(LIS3MDL_ADDR);
+  Wire.write(0x21);           // CTRL_REG2
+  Wire.write(0b00000000);     // +/-4 gauss
+  Wire.endTransmission();
+
+  Wire.beginTransmission(LIS3MDL_ADDR);
+  Wire.write(0x22);           // CTRL_REG3
+  Wire.write(0b00000000);     // Continuous conversion mode
+  Wire.endTransmission();
+
+  Serial.println("IMU initialized.");
+
+  // LoRa init
+  LoRa.setPins(LORA_NSS, LORA_RESET, LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa init failed!");
+    while (1);
+  }
+
+  Serial.println("LoRa ready.");
+  Serial.println("System ready.");
+}
+
+// ================= Loop =================
+void loop() {
+  // --- Read GPS ---
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // --- Read IMU ---
+  readAccel();
+  readMag();
+
+  // --- Compute orientation (roll, pitch, heading) from accel+mag ---
+  float roll  = atan2(ay, az);                       // radians
+  float pitch = atan2(-ax, sqrt(ay*ay + az*az));     // radians
+
+  // Simple magnetometer tilt compensation
+  float mx_corr = mx;
+  float my_corr = my;
+  float mz_corr = -mz;
+
+  float mx2 = mx_corr * cos(pitch) + mz_corr * sin(pitch);
+  float my2 = mx_corr * sin(roll) * sin(pitch) + my_corr * cos(roll) - mz_corr * sin(roll) * cos(pitch);
+
+  float heading = atan2(my2, mx2) * 180.0 / PI; // degrees
+  if (heading < 0) heading += 360.0;
+
+  float rollDeg  = roll  * 180.0 / PI;
+  float pitchDeg = pitch * 180.0 / PI;
+
+  // --- Only proceed if we have a GPS fix ---
+  if (gps.location.isValid()) {
+    haveFix = true;
+  }
+
+  if (!haveFix) {
+    Serial.println("Waiting for valid GPS fix...");
+    delay(200);
+    return;
+  }
+
+  // --- GPS values ---
+  float lat = gps.location.lat();
+  float lon = gps.location.lng();
+  float alt = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+
+  // --- Navigation math ---
+  float distanceToTarget = getDistance(lat, lon, targetLat, targetLon); // meters
+  float targetBearing = getBearing(lat, lon, targetLat, targetLon);    // degrees
+
+  float yawError = targetBearing - heading;
+  if (yawError > 180.0) yawError -= 360.0;
+  if (yawError < -180.0) yawError += 360.0;
+
+  // --- Determine descent mode ---
+  if (distanceToTarget < 15.0) descentMode = true;
+
+  // --- Adaptive gain adjustment ---
+  unsigned long now = millis();
+  if (!descentMode && (now - lastAdaptTime > adaptInterval)) {
+    bool gettingCloser = (distanceToTarget < prevDistance - improvementTol);
+
+    if (!gettingCloser) {
+      // Not improving → increase pitch (descend faster) and yaw a bit if large yaw error
+      kPitch += 0.2;
+      if (fabs(yawError) > 15.0) kYaw += 0.1;
+    } else {
+      // Improving → gently reduce gains
+      kPitch -= 0.05;
+      kYaw   -= 0.02;
+    }
+
+    // Clamp
+    kPitch = constrain(kPitch, 1.0, 6.0);
+    kYaw   = constrain(kYaw, 0.5, 3.0);
+
+    prevDistance = distanceToTarget;
+    lastAdaptTime = now;
+
+    Serial.print("Adaptive gains: kPitch=");
+    Serial.print(kPitch);
+    Serial.print(" kYaw=");
+    Serial.println(kYaw);
+  }
+
+  // --- Control law (normalized commands) ---
+  float yawCmd   = constrain(kYaw * (yawError / 90.0), -1.0, 1.0);
+  float pitchCmd = constrain(kPitch * (distanceToTarget / 100.0), -1.0, 1.0);
+
+  if (descentMode) {
+    // stabilized downward glide when close
+    pitchCmd = 0.6;
+    yawCmd *= 0.3;
+  }
+
+  // --- Mixing to 4 servos ---
+  // Mapping: TR/TL are front (top) servos, BR/BL are back servos.
+  // pitchCmd >0 => nose down: front servos move down, back servos move up
+  // yawCmd  >0 => turn right: right servos move more positive, left servos less
+  const float PITCH_SCALE = 20.0; // deg max pitch effect
+  const float YAW_SCALE   = 15.0; // deg max yaw differential
+
+  float frontEffect = -pitchCmd * PITCH_SCALE; // negative because front goes down for positive pitchCmd
+  float backEffect  =  pitchCmd * PITCH_SCALE;
+
+  float rightYawEffect = yawCmd * YAW_SCALE;
+  float leftYawEffect  = -yawCmd * YAW_SCALE;
+
+  float angleTR = 90.0 + frontEffect + rightYawEffect;  // Top Right
+  float angleTL = 90.0 + frontEffect + leftYawEffect;   // Top Left
+  float angleBR = 90.0 + backEffect  + rightYawEffect;  // Back Right
+  float angleBL = 90.0 + backEffect  + leftYawEffect;   // Back Left
+
+  // constrain to servo valid range
+  angleTR = constrain(angleTR, 0.0, 180.0);
+  angleTL = constrain(angleTL, 0.0, 180.0);
+  angleBR = constrain(angleBR, 0.0, 180.0);
+  angleBL = constrain(angleBL, 0.0, 180.0);
+
+  // Write servo outputs
+  servoTR.write((int)angleTR);
+  servoTL.write((int)angleTL);
+  servoBR.write((int)angleBR);
+  servoBL.write((int)angleBL);
+
+  // --- Prepare LoRa packet (CSV) ---
+  String packet = String(lat, 6) + "," +
+                  String(lon, 6) + "," +
+                  String(alt, 1) + "," +
+                  String(heading, 1) + "," +
+                  String(pitchDeg, 1) + "," +
+                  String(rollDeg, 1) + "," +
+                  String(distanceToTarget, 1) + "," +
+                  String(yawError, 1);
+
+  // Transmit via LoRa
+  LoRa.beginPacket();
+  LoRa.print(packet);
+  LoRa.endPacket();
+
+  // --- Serial debug (print same packet plus details) ---
+  Serial.println("============== TRANSMIT PACKET ==============");
+  Serial.println(packet);
+  Serial.println("---------------------------------------------");
+  Serial.print("Lat: "); Serial.print(lat, 6);
+  Serial.print(" Lon: "); Serial.print(lon, 6);
+  Serial.print(" Alt: "); Serial.print(alt, 1);
+  Serial.print(" | Dist: "); Serial.print(distanceToTarget, 1); Serial.print(" m");
+  Serial.print(" | TargetBrg: "); Serial.print(targetBearing, 1);
+  Serial.print(" | Heading: "); Serial.print(heading, 1);
+  Serial.print(" | YawErr: "); Serial.println(yawError, 1);
+  Serial.print("PitchCmd: "); Serial.print(pitchCmd, 3);
+  Serial.print(" YawCmd: "); Serial.print(yawCmd, 3);
+  Serial.print(" angles TR/TL/BR/BL: ");
+  Serial.print(angleTR); Serial.print("/");
+  Serial.print(angleTL); Serial.print("/");
+  Serial.print(angleBR); Serial.print("/");
+  Serial.println(angleBL);
+  Serial.println("");
+
+  delay(200); // loop rate ~5 Hz
+}
